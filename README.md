@@ -55,6 +55,13 @@ plugins (addons, thirdparty, cexidats, render, screenshot, hardwaremouse). Edit 
 
 Values within ~2× the baseline standard deviation are noise.
 
+**Scene drift guard.** If a re-baseline differs from the previous one by more than
+`drift_pct` (default 15 %), you moved / the crowd changed, and every result measured
+between those two baselines is flagged `?` in the table and the report — ignore them.
+While a run is active the window shows a live *scene stability* line so you can tell
+within a minute whether the run is going to be valid. Set `abort_on_drift = true` in the
+settings file to stop the run instead of flagging.
+
 ## Other commands
 
 ```

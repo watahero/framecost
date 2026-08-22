@@ -20,7 +20,7 @@
 
 addon.name    = 'framecost';
 addon.author  = 'watahero';
-addon.version = '1.0.0';
+addon.version = '1.0.1';
 addon.desc    = 'Shows what is using time each frame and measures per-addon frame cost.';
 addon.link    = 'https://github.com/watahero/framecost';
 
@@ -71,6 +71,8 @@ local default_settings = T{
         settle_seconds  = 2.5,
         rebaseline_every = 4,
         include_plugins = false,
+        drift_pct       = 15,     -- a re-baseline this far from the previous one marks the group unstable
+        abort_on_drift  = false,  -- stop the run instead of just flagging it
         exclude = T{ 'framecost', 'hideconsole', 'fps', 'move', 'nolock', 'timestamp' },
         exclude_plugins = T{ 'addons', 'thirdparty', 'cexidats', 'render', 'screenshot', 'hardwaremouse' },
     },
@@ -170,6 +172,8 @@ local profiler = {
     report = nil,
     sortCol = 'delta',
     sortAsc = false,
+    driftEvents = 0,
+    lastDriftPct = 0,
 };
 
 local function Print(msg)
@@ -358,12 +362,20 @@ local function WriteProfileReport()
     for i, b in ipairs(profiler.baselines) do
         f:write(string.format('  #%d  %.3f ms  (sd %.3f, %.1f fps, %d frames)\n', i, b.ms, b.stddev, b.fps, b.n));
     end
-    f:write('\nPer-addon cost (baseline - without addon). Positive = addon costs that much per frame.\n');
-    f:write(string.format('%-22s %-7s %10s %10s %10s %8s\n', 'name', 'kind', 'cost ms', 'without', 'baseline', 'sd'));
+    local flagged = 0;
     for _, r in ipairs(sorted) do
-        f:write(string.format('%-22s %-7s %10.3f %10.3f %10.3f %8.3f\n', r.name, r.kind, r.delta, r.ms, r.baseline, r.stddev));
+        if (r.unstable) then flagged = flagged + 1; end
     end
-    f:write('\nNote: values inside ~2x the baseline sd are noise. Measure standing still, camera fixed.\n');
+    if (profiler.driftEvents > 0) then
+        f:write(string.format('\n!! SCENE DRIFT: %d re-baseline(s) moved more than %d%%. %d of %d results are flagged "?" and should be ignored.\n',
+            profiler.driftEvents, cfg.profile.drift_pct, flagged, #sorted));
+    end
+    f:write('\nPer-addon cost (baseline - without addon). Positive = addon costs that much per frame.\n');
+    f:write(string.format('%-2s %-22s %-7s %10s %10s %10s %8s\n', '', 'name', 'kind', 'cost ms', 'without', 'baseline', 'sd'));
+    for _, r in ipairs(sorted) do
+        f:write(string.format('%-2s %-22s %-7s %10.3f %10.3f %10.3f %8.3f\n', r.unstable and '?' or '', r.name, r.kind, r.delta, r.ms, r.baseline, r.stddev));
+    end
+    f:write('\nNote: values inside ~2x the baseline sd are noise. "?" = scene changed around that sample. Measure standing still, camera fixed.\n');
     f:close();
     return path;
 end
@@ -415,6 +427,8 @@ local function StartProfile(seconds, onlyList, includePlugins)
     profiler.sinceBaseline = 0;
     profiler.report = nil;
     profiler.pending = 'baseline';
+    profiler.driftEvents = 0;
+    profiler.lastDriftPct = 0;
 
     profiler.savedDivisor = ReadDivisor();
     if (profiler.savedDivisor ~= nil) then
@@ -458,11 +472,25 @@ local function ProfilerFrame(frameSeconds)
         -- Re-score everything measured between the previous baseline and this one
         -- against the average of the two, so slow drift does not land on one addon.
         if (k >= 2) then
-            local mixed = (profiler.baselines[k - 1].ms + sample.ms) * 0.5;
+            local prev = profiler.baselines[k - 1].ms;
+            local mixed = (prev + sample.ms) * 0.5;
+            local driftPct = 100 * math.abs(sample.ms - prev) / math.max(0.001, math.min(prev, sample.ms));
+            local unstable = driftPct > (tonumber(cfg.profile.drift_pct) or 15);
+            profiler.lastDriftPct = driftPct;
             for _, r in ipairs(profiler.results) do
                 if (r.baseIdx == k - 1) then
                     r.baseline = mixed;
                     r.delta = mixed - r.ms;
+                    r.unstable = unstable;
+                end
+            end
+            if (unstable) then
+                profiler.driftEvents = profiler.driftEvents + 1;
+                PrintErr(string.format('Scene drift: baseline moved %.1f -> %.1f ms (%.0f%%). Results from the last group are flagged unstable.', prev, sample.ms, driftPct));
+                if (cfg.profile.abort_on_drift) then
+                    profiler.pending = nil;
+                    StopProfile('aborted: scene drift');
+                    return;
                 end
             end
         end
@@ -869,6 +897,16 @@ local function DrawProfiler()
         imgui.TextColored(COLORS.warn, string.format('%s  -  %s %.0fs left   (hands off!)', profiler.status, profiler.phase, remaining));
         if (profiler.baseline ~= nil) then
             imgui.TextColored(COLORS.dim, string.format('baseline %.3f ms  sd %.3f  (%.0f fps uncapped)', profiler.baseline.ms, profiler.baseline.stddev, profiler.baseline.fps));
+            local limit = tonumber(cfg.profile.drift_pct) or 15;
+            if (#profiler.baselines >= 2) then
+                local bad = profiler.lastDriftPct > limit;
+                imgui.TextColored(bad and COLORS.bad or COLORS.good,
+                    string.format('scene stability: last re-baseline drifted %.0f%%  %s', profiler.lastDriftPct, bad and 'UNSTABLE - stop moving' or 'ok'));
+            end
+            local first = profiler.baselines[1].ms;
+            local liveDrift = 100 * math.abs(state.emaTotal - first) / math.max(0.001, first);
+            imgui.TextColored(liveDrift > limit and COLORS.warn or COLORS.dim,
+                string.format('live frame vs first baseline: %.1f vs %.1f ms (%.0f%%)', state.emaTotal, first, liveDrift));
         end
         if (imgui.Button('Stop')) then
             StopProfile('stopped');
@@ -901,6 +939,9 @@ local function DrawProfiler()
     imgui.Separator();
     local noise = (profiler.baseline and profiler.baseline.stddev or 0) * 2;
     imgui.TextColored(COLORS.dim, string.format('cost = baseline - frame time without the addon.  noise floor ~%.2f ms', noise));
+    if (profiler.driftEvents > 0) then
+        imgui.TextColored(COLORS.bad, string.format('scene drifted %d time(s) during this run - rows marked ? are invalid', profiler.driftEvents));
+    end
     if (profiler.report ~= nil) then
         imgui.TextColored(COLORS.dim, 'saved: ' .. profiler.report);
     end
@@ -926,11 +967,13 @@ local function DrawProfiler()
             for _, r in ipairs(rows) do
                 imgui.TableNextRow();
                 imgui.TableNextColumn();
-                imgui.TextColored(DeltaColor(r.delta), r.name .. (r.kind == 'plugin' and ' (plugin)' or ''));
+                local rowColor = r.unstable and COLORS.dim or DeltaColor(r.delta);
+                imgui.TextColored(rowColor, (r.unstable and '? ' or '') .. r.name .. (r.kind == 'plugin' and ' (plugin)' or ''));
+                if (r.unstable) then Tooltip('Scene changed between the baselines around this sample. Ignore this value.'); end
                 imgui.TableNextColumn();
-                DrawStackedBar(100, 10, { { math.max(0, r.delta) / maxDelta, DeltaColor(r.delta) } });
+                DrawStackedBar(100, 10, { { math.max(0, r.delta) / maxDelta, rowColor } });
                 imgui.TableNextColumn();
-                imgui.TextColored(DeltaColor(r.delta), string.format('%+.3f', r.delta));
+                imgui.TextColored(rowColor, string.format('%+.3f', r.delta));
                 imgui.TableNextColumn();
                 imgui.TextColored(COLORS.text, string.format('%.3f', r.ms));
                 imgui.TableNextColumn();
